@@ -1,0 +1,5 @@
+excluded components from spinner reimplementation:
+this components are excluded because the user can't access it
+1. fleet-performance
+  1. fleet-activity-chart
+2. fracpump-performance-summary: this component isn't enywhere

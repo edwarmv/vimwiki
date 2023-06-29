@@ -1,0 +1,231 @@
+import { Injectable, OnDestroy } from '@angular/core';
+
+import { HttpClient, HttpHeaders, HttpErrorResponse } from '@angular/common/http';
+
+import { Observable, Subject, throwError } from 'rxjs';
+
+// As an example see
+// https://stackblitz.com/edit/advanced-caching-with-rxjs-step-4?file=app%2Fjoke.service.ts
+// https://blog.thoughtram.io/angular/2018/03/05/advanced-caching-with-rxjs.html
+
+import { shareReplay, map, takeUntil, catchError, tap } from 'rxjs/operators';
+
+import { FracpumpCO2Reduction, FracpumpEfficiency, FracpumpPerformanceResponse, FracpumpProductivity, FracpumpStates, FracpumpSummaryOutput, FracpumpSummarySavings, Signal } from '../../shared/data-types';
+
+import { TimeFrameDate, DEFAULT_SELECTED_TIMEFRAME, ResponseTimeFrameDate } from '../../shared/data-types/timeframe-types';
+
+import { AppConfig } from '@config';
+
+import { ApiUrlService } from '@auth';
+
+import { TimeframeService } from '../../shared/services';
+
+const CACHE_SIZE = 1; // Replay one instance of the cache (buffer)
+
+@Injectable()
+export class FracpumpPerformanceSummaryService implements OnDestroy {
+  private cache$: Observable<FracpumpPerformanceResponse<FracpumpSummaryOutput>>;
+  private reload$ = new Subject<void>();
+  public update$ = new Subject<void>();
+  public forceReload$ = new Subject<void>();
+  private unsubscribe$ = new Subject<void>();
+
+  private summaryResponseLoaded$ = new Subject<string | Date>();
+  public summaryResponseLoadedAsObserver = this.summaryResponseLoaded$.asObservable();
+
+  // Set default timeframe
+  public reportTimeFrame: TimeFrameDate = DEFAULT_SELECTED_TIMEFRAME;
+
+  private frackingOverviewRequestOption = {
+    headers: new HttpHeaders({
+      'Content-Type': 'application/json'
+    })
+  };
+
+  constructor(
+    private http: HttpClient,
+    private timeframeService: TimeframeService,
+    private apiUrlService: ApiUrlService
+  ) {}
+
+  // This method is responsible for fetching the data.
+  // The first one who calls this function will initiate
+  // the process of fetching data.
+  getPerformanceSummary(
+    assets: string[] = [],
+    timeframe?: TimeFrameDate
+  ): Observable<FracpumpPerformanceResponse<FracpumpSummaryOutput>> {
+    const timeframeService = timeframe ? timeframe : this.timeframeService.selectedTimeframeDate.getValue();
+    const startDate = new Date(timeframeService.start).toISOString();
+    const endDate = new Date(timeframeService.end).toISOString();
+    console.log({ startDate, endDate });
+
+    this.cache$ = this.requestPerformanceSummary(
+      // Body of the POST Header
+      JSON.stringify({
+        template: 'oilandgas:frac-pump:performance-summary',
+        parameters: {
+          timeframe: {
+            start: startDate,
+            end: endDate
+          },
+          assets
+        }
+      })
+    ).pipe(
+      // Notify the changes in the timeframe newest after the request end
+      tap((response) => this.summaryResponseLoaded$.next(response.timeframe.newest)),
+      takeUntil(this.reload$),
+      shareReplay(CACHE_SIZE)
+    );
+
+    return this.cache$;
+  }
+
+  // Set the timeframe of the requested report
+  // TODO: Why does the setter not work
+  // Cannot invoke an expression whose type lacks a call signature.
+  setTimeFrame(timeFrame: TimeFrameDate) {
+    //TODO: Make this failsafe
+    this.reportTimeFrame = timeFrame;
+  }
+
+  // Public facing API to force the cache to reload the data
+  forceReload() {
+    this.reload$.next();
+    this.cache$ = null;
+  }
+
+  // Helper method to actually fetch the performance summary JSON from the report service
+  private requestPerformanceSummary(body: Object): Observable<FracpumpPerformanceResponse<FracpumpSummaryOutput>> {
+    let requestUrl = this.apiUrlService.getBaseURL() + AppConfig.settings.reportService.url;
+
+    const toLocaleString = (date: string, appendUTCSuffix: boolean = true) =>
+      new Date(`${date}${appendUTCSuffix ? 'Z' : ''}`).toLocaleString('en-US');
+
+    let tmp = this.http
+      .post(requestUrl, body, this.frackingOverviewRequestOption)
+      .pipe(
+        takeUntil(this.unsubscribe$),
+        map((response) => this.performanceSummaryMapper(response)),
+        map((response) => {
+          for (const property in response.output.operation_hours) {
+            if (response.output.operation_hours[property].value < 0) {
+              throw new RangeError('All operations hours must be positive');
+            }
+          }
+          return response;
+        }), // Map the request to the output
+        //error handling
+        catchError((err) => {
+          let error = {};
+          error['message'] = 'Something went wrong.';
+          if (err instanceof RangeError) {
+            error['message'] = err.message;
+          }
+          if (err instanceof HttpErrorResponse) {
+            error['status'] = err.status;
+            switch (err.status) {
+              case 401: {
+                error['message'] = 'Request is unauthorized. Please login again.';
+                break;
+              }
+              case 404: {
+                error['message'] = 'No data found. Please select a different date range.';
+                break;
+              }
+            }
+          }
+
+          return throwError(() => error);
+        })
+      );
+
+    return tmp;
+  }
+
+  performanceSummaryMapper(value: any): FracpumpPerformanceResponse<FracpumpSummaryOutput>{
+    const signal = (value: any): Signal => ({
+      value: value['value'],
+      unit: value['unit']
+    })
+
+    const operation_hours = (value:any): FracpumpStates => ({
+      pumping: signal(value['pumping']),
+      conditioning: signal(value['conditioning']),
+      nonpumping: signal(value['nonpumping']),
+      ready: signal(value['ready']),
+      active: signal(value['active']),
+      engine: signal(value['engine']),
+    })
+
+    const co2_reduction = (value:any): FracpumpCO2Reduction => ({
+      engine_oil: signal(value['engine_oil']),
+      transmission_oil: signal(value['transmission_oil']),
+      fuel: signal(value['fuel']),
+    })
+
+    const efficiency = (value:any): FracpumpEfficiency => ({
+      esc: signal(value['esc']),
+      operation: signal(value['operation']),
+    })
+
+    const productivity = (value:any): FracpumpProductivity => ({
+      engine: signal(value['engine']),
+      unit: signal(value['unit']),
+    })
+
+    type Asset = {
+        title: string;
+        uuid: string;
+      }
+
+    const asset = (value: any): Asset => ({
+      title: value['title'],
+      uuid: value['uuid']
+    })
+
+    const savings = (value:any): FracpumpSummarySavings => ({
+      engine_idle: signal(value['engine_idle']),
+      fuel: signal(value['fuel']),
+      engine_oil: signal(value['engine_oil']),
+      transmission_oil: signal(value['transmission_oil']),
+    })
+
+    const timeframe = (value: any): ResponseTimeFrameDate => ({
+      newest: new Date(value['newest']),
+      oldest: new Date(value['oldest']),
+    })
+
+    const output = (value: any): FracpumpSummaryOutput => ({
+      operation_hours: operation_hours(value['operation_hours']),
+      co2_reduction: co2_reduction(value['co2_reduction']),
+      efficiency: efficiency(value['efficiency']),
+      productivity: productivity(value['productivity']),
+      assets: value['assets'].map(value => asset(value)),
+      savings: savings(value['savings']),
+      timeframe: timeframe(value['timeframe'])
+    })
+
+    type Parameters = { assets: string[]; timeframe: TimeFrameDate };
+
+    const parameters = (value: any): Parameters => ({
+      assets: value['assets'],
+      timeframe: timeframe(value['timeframe'])
+    })
+
+    return {
+      templatename: value['templatename'],
+      output: output(value['output']),
+      timeframe: timeframe(value['timeframe']),
+      parameters: 
+        }
+  }
+
+  ngOnDestroy() {
+    // Unsubscribe from the observable
+    this.unsubscribe$.next();
+    this.unsubscribe$.complete();
+  }
+}
+

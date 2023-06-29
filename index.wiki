@@ -1,0 +1,13 @@
+= Current ticket =
+
+----
+
+== [[SOPHIA-1782]] ==
+quick timeframe selector
+datepicker selector
+
+== [[thinking_reactively]] ==
+
+== [[sophia-1793-restructure-loading-spinner]] ==
+
+== [[sophia-1852]] ==

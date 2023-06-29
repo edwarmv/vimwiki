@@ -1,0 +1,5 @@
+que es programacion reactiva
+
+basicamente programacion reactiva es programar con flujos de datos asincronos
+
+hasta aqui no hay nada nuevo, los eventos de click son en realidad un flujo de eventos asincronos, a los cuales nosotros podemos observar y realizar algunos efectos secundarios
